@@ -1,0 +1,48 @@
+# Python bytecode and packaging output. Leading slashes anchor build/ and dist/
+# to the repo root so they can't swallow a real source directory further down.
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+
+# Virtualenv
+.venv/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Generated output. The .docx is derived from a .tex and a .bib, so a copy in
+# the tree is worse than no copy: it goes stale silently and a reader cannot
+# tell. The work directory holds the figure renders and the converted source.
+*.docx
+*-work/
+
+# LaTeX build artifacts, for when a fixture .tex gets compiled beside its source.
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+
+# Google OAuth material — the client secret and the token the auth flow writes
+# next to it. The global ~/.config/git/ignore covers some of these, but that
+# file is per-machine and invisible to clones, so the rule lives here.
+credentials.json
+client_secret*.json
+token.json
+
+# Secrets and local credentials. The !.env.example line keeps the committed
+# sample visible (github/gitignore Node.gitignore uses exactly this triple).
+.env
+.env.*
+!.env.example
+
+# Claude Code working files. The global ~/.config/git/ignore blocks these too,
+# but that file is per-machine and invisible to clones, so the rule lives here.
+.claude/
+CLAUDE.md

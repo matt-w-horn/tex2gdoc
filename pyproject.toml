@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tex2gdoc"
+version = "0.1.0"
+description = "Convert a LaTeX paper to a .docx for review in Word or Google Docs"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Matt Horn", email = "matt@matthorn.io" }]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+tex2gdoc = "tex2gdoc.tex2gdoc:main"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# Defaults are E4/E7/E9 + F only. Adding I (import order), UP (pyupgrade) and
+# B (bugbear) costs nothing to run and catches the things review would flag.
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "regression: converts a real paper and compares it against a recorded fingerprint; needs TEX2GDOC_REGRESSION_TEX plus pandoc and a TeX engine, so it skips in CI",
+]

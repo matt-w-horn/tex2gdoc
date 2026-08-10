@@ -1,0 +1,66 @@
+% A small paper that exercises everything the converter exists for: a pgfplots
+% figure, a starred float, a nested tabular inside a cell, an alltt listing with
+% math escapes, a cross-reference to a float, and a citation.
+%
+% Convert it with:   tex2gdoc examples/sample.tex
+\documentclass[twocolumn]{article}
+\usepackage{alltt}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{booktabs}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Queues under load}
+\author{A. Example}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+Arrival rate $\lambda$ and capacity $C$ decide whether a queue settles, as
+Figure~\ref{fig:throughput} shows and Table~\ref{tab:cases} summarises.
+The condition is $\lambda K < C$~\cite{example2020}.
+
+\begin{figure}
+  \centering
+  \begin{tikzpicture}
+    \begin{axis}[width=\columnwidth, height=0.7\columnwidth,
+        xlabel={arrival rate $\lambda$}, ylabel={throughput},
+        xmin=0, xmax=10, ymin=0, ymax=6,
+        legend pos=north west, legend style={font=\scriptsize}]
+      \addplot[thick, domain=0:5] {x};
+      \addlegendentry{unsaturated}
+      \addplot[thick, dashed, domain=5:10] {5};
+      \addlegendentry{saturated}
+    \end{axis}
+  \end{tikzpicture}
+  \caption{Throughput against arrival rate, with a knee at capacity.}
+  \label{fig:throughput}
+\end{figure}
+
+\section{A definition}
+The state is a record:
+
+\begin{alltt}\footnotesize
+structure Loop where
+  lam : \(\mathbb{R}\)
+  cap : \(\mathbb{R}\)
+  lam_nonneg : 0 \(\le\) lam
+\end{alltt}
+
+\begin{table*}
+  \caption{Two regimes, and the names that certify each one.}
+  \label{tab:cases}
+  \begin{tabular}{l l}
+    \toprule
+    Regime & Certificate \\
+    \midrule
+    Unsaturated & \begin{tabular}[t]{@{}l@{}}\code{settles_of_lt},\\ \code{unique_fixed_point}\end{tabular} \\
+    Saturated & \code{diverges_of_ge} \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\bibliographystyle{plain}
+\bibliography{sample}
+\end{document}

@@ -1,0 +1,8 @@
+# gitleaks config — keeps every built-in secret rule. The Google OAuth client
+# secret and token for this project stay outside the repo (see .gitignore), so
+# this is a backstop against an accidental paste.
+# https://github.com/gitleaks/gitleaks#configuration
+title = "tex2gdoc"
+
+[extend]
+useDefault = true # built-in rules: Google API keys, generic high-entropy, etc.

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          # Keep level with the Python on the laptop. Same reasoning as the npm
+          # major pin in the JS repos: a version skew between here and local is
+          # what turns a green local run into a red CI run.
+          python-version: '3.14'
+          cache: pip
+          # pip caching defaults to globbing requirements.txt, which this repo
+          # doesn't have; without this the step errors on "no file matched".
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e '.[dev]'
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest
