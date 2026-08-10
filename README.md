@@ -64,7 +64,22 @@ passes as a good one.
 
 ## Install
 
-You need `pandoc`, a TeX engine, and `pdftocairo` from Poppler.
+```bash
+brew install matt-w-horn/tap/tex2gdoc
+```
+
+That pulls in the three tools it shells out to, so nothing else has to be set up
+first: `pandoc` for the conversion, `tectonic` for the figures pandoc cannot
+render, and `pdftocairo` from Poppler to rasterize them.
+
+`tectonic` is preferred over `pdflatex`. It fetches the packages a figure needs,
+so no full TeX distribution is required, and it is XeTeX-based, which matches how
+most modern papers are built. Pass `--tex-engine pdflatex` to use the other one.
+
+### From source
+
+For working on the tool rather than using it. Python 3.14, and the same three
+binaries.
 
 ```bash
 brew install pandoc poppler tectonic
@@ -73,10 +88,6 @@ brew install pandoc poppler tectonic
 ```bash
 pip install -e '.[dev]'
 ```
-
-`tectonic` is preferred over `pdflatex`. It fetches the packages a figure needs,
-so no full TeX distribution is required, and it is XeTeX-based, which matches how
-most modern papers are built. Pass `--tex-engine pdflatex` to use the other one.
 
 ## Use
 
