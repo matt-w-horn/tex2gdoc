@@ -161,9 +161,15 @@ def parse_ooxml(raw: str, part: str) -> ET.Element:
 
     Both external-entity (XXE) and entity-expansion ("billion laughs") attacks
     need a DOCTYPE, and no part pandoc writes has one, so rejecting a DTD removes
-    the whole class without pulling in `defusedxml`. A DOCTYPE is only valid in
-    the prolog, so scanning the head is sufficient: anything later is malformed
-    and the parser rejects it anyway.
+    the whole class without pulling in `defusedxml`.
+
+    The scan covers the first 8 KB rather than the whole part. That is not
+    airtight: a legal prolog comment longer than 8 KB pushes the declaration past
+    the window. It is deliberately left there, because ElementTree resolves
+    neither external entities nor an external DTD, so what a bypass reaches is
+    entity expansion, and that is a denial of service rather than a disclosure.
+    Widen the window, or scan to the first element start tag, if this parser is
+    ever pointed at something where that matters.
 
     A .docx is normally produced locally by this script, but `verify()` reads
     whatever path it is given, including a file that came back from a co-author,
