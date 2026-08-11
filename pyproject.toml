@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tex2gdoc"
-version = "0.1.0"
+version = "0.2.0"
 description = "Convert a LaTeX paper to a .docx for review in Word or Google Docs"
 readme = "README.md"
 license = "MIT"

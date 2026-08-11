@@ -35,3 +35,15 @@ def test_py_typed_marker_ships_with_the_package() -> None:
     spec = importlib.util.find_spec("tex2gdoc")
     assert spec is not None and spec.origin is not None
     assert (Path(spec.origin).parent / "py.typed").is_file()
+
+
+def test_declared_version_matches_the_package() -> None:
+    """The release workflow tags from pyproject; the package reports its own.
+
+    If those drift, `v0.2.0` ships a package that says 0.1.0 and every bug
+    report carries the wrong number. Nothing else compares them.
+    """
+    import tomllib
+
+    declared = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    assert declared["project"]["version"] == tex2gdoc.__version__
