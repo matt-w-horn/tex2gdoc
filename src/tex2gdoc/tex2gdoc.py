@@ -31,10 +31,12 @@ Docs maps them onto its native styles and its style menu keeps working.
 Every OOXML edit and every OOXML check operates on a parsed tree, never on
 serialized text. That is what lets the output survive a pandoc upgrade changing
 how it spaces its tags, and it means a malformed document is caught by the
-parser rather than quietly matching nothing.
+parser rather than quietly matching nothing. `ooxml` owns the one parser, the
+element builder, and the tag and attribute names; nothing here constructs XML
+from a string, and ruff blocks importing another parser.
 
 The verification step is the point, and it runs against the output file rather
-than a copy or an intermediate. All 18 checks are calibrated: `--self-test`
+than a copy or an intermediate. All 21 checks are calibrated: `--self-test`
 builds input designed to break each one and asserts it reports FAIL, and adding
 a check without a calibration case fails that gate. It needs no pandoc, no TeX.
 
@@ -86,11 +88,29 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
+
+from .ooxml import (
+    XML_SPACE_PRESERVE,
+    Attr,
+    Attribute,
+    SafeElement,
+    Tag,
+    Value,
+    attribute,
+    child,
+    children,
+    descendants,
+    make,
+    parse_part,
+    qn,
+    serialize_part,
+    value_of,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     # Imported lazily at runtime inside convert(). `verification` reads this
@@ -101,83 +121,51 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
 # OOXML parsing
 # --------------------------------------------------------------------------
 
-# Every prefix pandoc declares, registered so a round-trip writes them back
-# unchanged rather than inventing ns0, ns1. Checked against pandoc 3.10.1's
-# output: nine prefixes on document.xml, two on styles.xml, and no
-# `mc:Ignorable`, which matters because that attribute names prefixes as text
-# and would break if one were renamed.
-NS = {
-    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
-    "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
-    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    "o": "urn:schemas-microsoft-com:office:office",
-    "v": "urn:schemas-microsoft-com:vml",
-    "w10": "urn:schemas-microsoft-com:office:word",
-    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-    "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
-    "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
-}
-for _prefix, _uri in NS.items():
-    ET.register_namespace(_prefix, _uri)
-
-XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
-XML_DECLARATION = '<?xml version="1.0" encoding="UTF-8"?>\n'
+# The namespace table, the hardened parser and the element builder all live in
+# `ooxml`, which is the only module allowed to turn bytes into a tree.
 
 
-def qn(prefixed: str) -> str:
-    """Turn `w:tbl` into ElementTree's Clark notation.
+class StyleId(StrEnum):
+    """The pandoc style ids this converter is allowed to touch.
 
-    One function rather than a `w()` and an `m()`, because this module already
-    uses both `w` and `m` as local names for regex matches and cell widths, and
-    a shadowed helper fails in a way that reads like a typo.
+    Everything not named here keeps pandoc's own definition on purpose, so Word
+    and Google Docs map Heading1-3, Title and Caption onto their native styles.
     """
-    prefix, _, local = prefixed.partition(":")
-    return f"{{{NS[prefix]}}}{local}"
+
+    NORMAL = "Normal"
+    BODY_TEXT = "BodyText"
+    COMPACT = "Compact"
+    CAPTIONED_FIGURE = "CaptionedFigure"
+    FIGURE = "Figure"
+    IMAGE_CAPTION = "ImageCaption"
+    VERBATIM_CHAR = "VerbatimChar"
+    SOURCE_CODE = "SourceCode"
+    FIRST_PARAGRAPH = "FirstParagraph"
+    BIBLIOGRAPHY = "Bibliography"
+    ABSTRACT = "Abstract"
+    BLOCK_TEXT = "BlockText"
+    AUTHOR = "Author"
+    SUBTITLE = "Subtitle"
+    HEADING_1 = "Heading1"
 
 
-def wval(element: ET.Element | None) -> str | None:
-    """The `w:val` of an element, or None if the element is absent."""
-    return element.get(qn("w:val")) if element is not None else None
+# Keyword attribute values live in `ooxml.Value`; this one is a measurement.
+HEADER_FOOTER_MARGIN = 360
 
 
-def parse_fragment(fragment: str) -> list[ET.Element]:
-    """Parse a bare run of XML elements that share the w namespace.
-
-    The style patches are written as literal XML because that is the clearest
-    way to state a declarative bundle of properties. Parsing them here means the
-    document is still assembled as a tree, so nothing downstream depends on how
-    they were spelled.
-    """
-    wrapper = f'<wrap xmlns:w="{NS["w"]}">{fragment}</wrap>'
-    return list(ET.fromstring(wrapper))
+def serialize_ooxml(root: SafeElement) -> str:
+    return serialize_part(root).decode("utf-8")
 
 
-def serialize_ooxml(root: ET.Element) -> str:
-    return XML_DECLARATION + ET.tostring(root, encoding="unicode")
+def parse_ooxml(raw: str, part: str) -> SafeElement:
+    """Parse an OOXML part through the package's one hardened parser.
 
-
-def parse_ooxml(raw: str, part: str) -> ET.Element:
-    """Parse an OOXML part, refusing anything that carries a DTD.
-
-    Both external-entity (XXE) and entity-expansion ("billion laughs") attacks
-    need a DOCTYPE, and no part pandoc writes has one, so rejecting a DTD removes
-    the whole class without pulling in `defusedxml`.
-
-    The scan covers the first 8 KB rather than the whole part. That is not
-    airtight: a legal prolog comment longer than 8 KB pushes the declaration past
-    the window. It is deliberately left there, because ElementTree resolves
-    neither external entities nor an external DTD, so what a bypass reaches is
-    entity expansion, and that is a denial of service rather than a disclosure.
-    Widen the window, or scan to the first element start tag, if this parser is
-    ever pointed at something where that matters.
-
-    A .docx is normally produced locally by this script, but `verify()` reads
+    The hardening, and the reasoning behind it, live in `ooxml`. This wrapper
+    stays because callers hold parts as `str`, and because `verify()` reads
     whatever path it is given, including a file that came back from a co-author,
-    so provenance is not assumed.
+    so provenance is not assumed anywhere in this package.
     """
-    if re.search(r"<!DOCTYPE", raw[:8192], re.IGNORECASE):
-        raise ValueError(f"{part} carries a DTD; refusing to parse it")
-    return ET.fromstring(raw)
+    return parse_part(raw.encode("utf-8"), part)
 
 
 # --------------------------------------------------------------------------
@@ -305,7 +293,7 @@ def table_probe(tabular: str, full_source: str) -> str | None:
     # output cannot have come from somewhere else.
     unique = [c for c in candidates if full_source.count(c) == 1]
     pool = unique or candidates
-    return max(pool, key=len)
+    return str(max(pool, key=len))
 
 
 def collect_source_facts(src: str) -> SourceFacts:
@@ -394,7 +382,7 @@ def default_tex_engine() -> str:
     return TEX_ENGINES[0]
 
 
-def run_tex(engine: str, stem: str, workdir: Path) -> subprocess.CompletedProcess:
+def run_tex(engine: str, stem: str, workdir: Path) -> subprocess.CompletedProcess[str]:
     """Compile <stem>.tex inside workdir with the chosen engine.
 
     tectonic swallows the engine's own chatter unless asked for it, so `--print`
@@ -402,13 +390,19 @@ def run_tex(engine: str, stem: str, workdir: Path) -> subprocess.CompletedProces
     .log that a failure needs to quote.
     """
     if engine == "tectonic":
-        cmd = ["tectonic", "--print", "--keep-logs", f"{stem}.tex"]
+        cmd = [resolve_tool("tectonic"), "--print", "--keep-logs", f"{stem}.tex"]
     else:
-        cmd = ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", f"{stem}.tex"]
-    return subprocess.run(cmd, cwd=workdir, capture_output=True, text=True)
+        cmd = [
+            resolve_tool("pdflatex"),
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            f"{stem}.tex",
+        ]
+    # argv is built above from a resolved engine and a temp path.
+    return subprocess.run(cmd, cwd=workdir, capture_output=True, text=True)  # noqa: S603
 
 
-def tex_output(result: subprocess.CompletedProcess, stem: str, workdir: Path) -> str:
+def tex_output(result: subprocess.CompletedProcess[str], stem: str, workdir: Path) -> str:
     """Everything the engine said: stdout, stderr, and the .log if one survived."""
     parts = [result.stdout or "", result.stderr or ""]
     log = workdir / f"{stem}.log"
@@ -546,7 +540,7 @@ def render_figure(
     """Compile one TikZ picture standalone and rasterize it. Returns (ok, detail)."""
     stem = f"fig-{fig.label}"
 
-    def build(pre: str) -> subprocess.CompletedProcess:
+    def build(pre: str) -> subprocess.CompletedProcess[str]:
         (workdir / f"{stem}.tex").write_text(
             "\\documentclass[tikz,border=2pt]{standalone}\n"
             "\\usepackage{amsmath,amssymb}\n"
@@ -570,8 +564,8 @@ def render_figure(
             return False, f"{engine} failed for {fig.label}:\n{tail}"
         fig.fallback_preamble = True
 
-    subprocess.run(
-        ["pdftocairo", "-png", "-r", str(dpi), "-singlefile", f"{stem}.pdf", stem],
+    subprocess.run(  # noqa: S603 - fixed argv, shell=False, arguments built here
+        [resolve_tool("pdftocairo"), "-png", "-r", str(dpi), "-singlefile", f"{stem}.pdf", stem],
         cwd=workdir,
         capture_output=True,
         text=True,
@@ -694,7 +688,7 @@ def alltt_to_verbatim(src: str) -> tuple[str, int, set[str]]:
     """
     unmapped: set[str] = set()
 
-    def convert_math(m: re.Match) -> str:
+    def convert_math(m: re.Match[str]) -> str:
         body = m.group(1).strip()
         if body in MATH_TO_UNICODE:
             return MATH_TO_UNICODE[body]
@@ -707,7 +701,7 @@ def alltt_to_verbatim(src: str) -> tuple[str, int, set[str]]:
 
     count = 0
 
-    def convert_block(m: re.Match) -> str:
+    def convert_block(m: re.Match[str]) -> str:
         nonlocal count
         count += 1
         body = MATH_ESCAPE_RE.sub(convert_math, m.group(1))
@@ -749,7 +743,7 @@ def resolve_float_references(src: str) -> tuple[str, int]:
         return src, 0
     replaced = 0
 
-    def sub(m: re.Match) -> str:
+    def sub(m: re.Match[str]) -> str:
         nonlocal replaced
         key = m.group(1)
         if key not in numbering:
@@ -760,13 +754,32 @@ def resolve_float_references(src: str) -> tuple[str, int]:
     return REF_RE.sub(sub, src), replaced
 
 
-def rewrite_source(src: str, figures: list[Figure], figdir: Path) -> tuple[str, dict[str, object]]:
+@dataclass(frozen=True)
+class Rewrites:
+    """What each source transformation did, for the run to report.
+
+    Four counts and a set of macro names. As a dict[str, object] every read
+    needed a cast, and `sorted(stats.unmapped)` type-checked only because
+    `object` says nothing.
+    """
+
+    flattened: int
+    unstarred: int
+    refs: int
+    listings: int
+    unmapped: set[str]
+
+
+def rewrite_source(src: str, figures: list[Figure], figdir: Path) -> tuple[str, Rewrites]:
     """Apply every transformation pandoc needs, and report what each one did."""
     by_block = {f.block: f for f in figures if f.png}
 
-    def replace(match: re.Match) -> str:
+    def replace(match: re.Match[str]) -> str:
         fig = by_block.get(match.group(0))
-        if fig is None:
+        # by_block only holds figures with a rendered png, so the second test is
+        # unreachable; it is a check rather than an assert because asserts are
+        # stripped under -O, and it narrows the type for free.
+        if fig is None or fig.png is None:
             return match.group(0)
         include = f"\\includegraphics[width=\\linewidth]{{{figdir.name}/{fig.png.name}}}"
         return TIKZ_RE.sub(lambda _: include, match.group(0), count=1)
@@ -776,13 +789,13 @@ def rewrite_source(src: str, figures: list[Figure], figdir: Path) -> tuple[str, 
     src, unstarred = unstar_float_environments(src)
     src, refs = resolve_float_references(src)
     src, listings, unmapped = alltt_to_verbatim(src)
-    return src, {
-        "flattened": flattened,
-        "unstarred": unstarred,
-        "refs": refs,
-        "listings": listings,
-        "unmapped": unmapped,
-    }
+    return src, Rewrites(
+        flattened=flattened,
+        unstarred=unstarred,
+        refs=refs,
+        listings=listings,
+        unmapped=unmapped,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -803,12 +816,35 @@ TEXT_WIDTH = PAGE_WIDTH - 2 * MARGIN
 # on Windows, macOS, and Google Docs alike; a prettier choice would silently
 # fall back to a proportional font for some readers.
 CODE_FONT = "Courier New"
+# The face a renderer lays equations out in. The document never names it;
+# this is only the hint that survives in fontTable.
+MATH_FONT = "Cambria Math"
+FONT_NAME_SLOTS = (Attr.ASCII, Attr.HIGH_ANSI, Attr.COMPLEX_SCRIPT, Attr.EAST_ASIAN)
 
-SECT_PR = (
-    f'<w:sectPr><w:pgSz w:w="{PAGE_WIDTH}" w:h="{PAGE_HEIGHT}" />'
-    f'<w:pgMar w:top="{MARGIN}" w:right="{MARGIN}" w:bottom="{MARGIN}" w:left="{MARGIN}"'
-    f' w:header="360" w:footer="360" w:gutter="0" /></w:sectPr>'
-)
+
+def section_properties() -> SafeElement:
+    """The page size and margins, built rather than spelled out as markup.
+
+    A function rather than a module constant because an element is mutable and
+    is consumed by being appended to a tree: handing the same one to two
+    documents would move it out of the first.
+    """
+    return make(
+        Tag.SECTION_PROPERTIES,
+        children=[
+            make(Tag.PAGE_SIZE, Attr.WIDTH.of(PAGE_WIDTH), Attr.HEIGHT.of(PAGE_HEIGHT)),
+            make(
+                Tag.PAGE_MARGIN,
+                Attr.TOP.of(MARGIN),
+                Attr.RIGHT.of(MARGIN),
+                Attr.BOTTOM.of(MARGIN),
+                Attr.LEFT.of(MARGIN),
+                Attr.HEADER.of(HEADER_FOOTER_MARGIN),
+                Attr.FOOTER.of(HEADER_FOOTER_MARGIN),
+                Attr.GUTTER.of(0),
+            ),
+        ],
+    )
 
 
 # Only what is functional. Everything else keeps pandoc's own definition, so
@@ -821,34 +857,105 @@ SECT_PR = (
 # "Heading 2" from the menu reproduced this script's blue rather than the
 # document's own. Overriding the appearance of a built-in style is the thing to
 # avoid; setting layout that the reader cannot otherwise get is not.
-def _body_spacing(after: int, line: int = 276) -> str:
-    """Paragraph spacing in twentieths of a point. line=276 is 1.15 lines."""
-    return (
-        f'<w:pPr><w:spacing w:before="0" w:after="{after}"'
-        f' w:line="{line}" w:lineRule="auto" /></w:pPr>'
-    )
+@dataclass(frozen=True)
+class StylePatch:
+    """What a style must carry, as properties rather than as markup.
+
+    Every field is a layout decision someone can argue with. Written as XML
+    these were a wall of angle brackets in which `w:line="276"` and
+    `w:lineRule="auto"` had to travel together and nothing said so; here the
+    pairing is the builder's problem and a reader sees only the decision.
+    """
+
+    space_after: int | None = None
+    space_before: int | None = None
+    line: int | None = None
+    # "auto" makes the line as tall as the tallest thing on it, so any line
+    # carrying an inline equation grows and the page develops ragged leading
+    # that LaTeX never shows. "exact" pins it, which is what makes the two
+    # match. See TALL_MATH for what has to be exempted.
+    line_rule: Value = Value.EXACT
+    keep_next: bool = False
+    keep_lines: bool = False
+    centered: bool = False
+    shading: str | None = None
+    monospace: bool = False
+
+    def paragraph_properties(self) -> SafeElement | None:
+        properties: list[SafeElement] = []
+        if self.keep_next:
+            properties.append(make(Tag.KEEP_NEXT))
+        if self.keep_lines:
+            properties.append(make(Tag.KEEP_LINES))
+        spacing: list[Attribute] = []
+        if self.space_before is not None:
+            spacing.append(Attr.BEFORE.of(self.space_before))
+        if self.space_after is not None:
+            spacing.append(Attr.AFTER.of(self.space_after))
+        if self.line is not None:
+            # A line value means nothing without its rule, so the builder
+            # supplies the pair and no caller can forget half of it.
+            spacing += [Attr.LINE.of(self.line), Attr.LINE_RULE.of(self.line_rule)]
+        if spacing:
+            properties.append(make(Tag.SPACING, *spacing))
+        if self.shading is not None:
+            properties.append(
+                make(
+                    Tag.SHADING,
+                    Attr.VAL.of(Value.CLEAR),
+                    Attr.COLOR.of(Value.AUTO),
+                    Attr.FILL.of(self.shading),
+                )
+            )
+        if self.centered:
+            properties.append(make(Tag.JUSTIFICATION, Attr.VAL.of(Value.CENTER)))
+        return make(Tag.PARAGRAPH_PROPERTIES, children=properties) if properties else None
+
+    def run_properties(self) -> SafeElement | None:
+        if not self.monospace:
+            return None
+        fonts = make(
+            Tag.FONTS,
+            Attr.ASCII.of(CODE_FONT),
+            Attr.HIGH_ANSI.of(CODE_FONT),
+            Attr.COMPLEX_SCRIPT.of(CODE_FONT),
+        )
+        return make(Tag.RUN_PROPERTIES, children=[fonts])
+
+    def elements(self) -> list[SafeElement]:
+        return [e for e in (self.paragraph_properties(), self.run_properties()) if e is not None]
 
 
-STYLE_PATCHES: dict[str, str] = {
+# 1.15 line spacing, expressed the way OOXML counts it: 240 twentieths of a
+# point is single, so 276 is 1.15.
+LINE_115 = 276
+
+STYLE_PATCHES: dict[StyleId, StylePatch] = {
     # 1.15 line and 8pt after a paragraph are Google Docs' own body defaults, so
     # the import matches a document created there rather than announcing itself.
-    "Normal": _body_spacing(after=160),
-    "BodyText": _body_spacing(after=160),
+    # space_before is pinned to 0 rather than left to inherit, because that is
+    # Docs' own default and a host template with a nonzero before would
+    # otherwise reflow the body. Dropping it was an unintended behaviour change
+    # when these patches moved from literal XML to StylePatch on 2026-08-10.
+    StyleId.NORMAL: StylePatch(space_before=0, space_after=160, line=LINE_115),
+    StyleId.BODY_TEXT: StylePatch(space_before=0, space_after=160, line=LINE_115),
     # List items stay tight: 8pt between consecutive bullets reads as broken.
-    "Compact": _body_spacing(after=0),
+    StyleId.COMPACT: StylePatch(space_before=0, space_after=0, line=LINE_115),
     # Centring a figure is layout, not decoration, and `verify()` checks for it.
-    "CaptionedFigure": '<w:pPr><w:keepNext /><w:jc w:val="center" /></w:pPr>',
-    "Figure": '<w:pPr><w:keepNext /><w:jc w:val="center" /></w:pPr>',
-    "ImageCaption": '<w:pPr><w:jc w:val="center" /></w:pPr>',
+    StyleId.CAPTIONED_FIGURE: StylePatch(keep_next=True, centered=True),
+    StyleId.FIGURE: StylePatch(keep_next=True, centered=True),
+    StyleId.IMAGE_CAPTION: StylePatch(centered=True),
     # Code has to be monospace to be readable at all, and the shaded block is
     # what separates a listing from prose.
-    "VerbatimChar": f'<w:rPr><w:rFonts w:ascii="{CODE_FONT}" w:hAnsi="{CODE_FONT}"'
-    f' w:cs="{CODE_FONT}" /></w:rPr>',
-    "SourceCode": "<w:pPr><w:keepLines />"
-    '<w:spacing w:before="80" w:after="80" w:line="240" w:lineRule="auto" />'
-    '<w:shd w:val="clear" w:color="auto" w:fill="F7F8FA" /></w:pPr>'
-    f'<w:rPr><w:rFonts w:ascii="{CODE_FONT}" w:hAnsi="{CODE_FONT}"'
-    f' w:cs="{CODE_FONT}" /></w:rPr>',
+    StyleId.VERBATIM_CHAR: StylePatch(monospace=True),
+    StyleId.SOURCE_CODE: StylePatch(
+        keep_lines=True, space_before=80, space_after=80, line=240, shading="F7F8FA", monospace=True
+    ),
+}
+
+
+PATCH_BY_STYLE_ID: Final[dict[str, StylePatch]] = {
+    style.value: patch for style, patch in STYLE_PATCHES.items()
 }
 
 
@@ -861,14 +968,15 @@ def patch_styles(styles_xml: str) -> str:
     named styles mean.
     """
     root = parse_ooxml(styles_xml, "word/styles.xml")
-    for style in root.iter(qn("w:style")):
-        patch = STYLE_PATCHES.get(style.get(qn("w:styleId")))
+    for style in descendants(root, Tag.STYLE):
+        style_id = attribute(style, Attr.STYLE_ID)
+        patch = PATCH_BY_STYLE_ID.get(style_id) if style_id else None
         if patch is None:
             continue
-        for tag in ("w:pPr", "w:rPr"):
-            for existing in style.findall(qn(tag)):
+        for tag in (Tag.PARAGRAPH_PROPERTIES, Tag.RUN_PROPERTIES):
+            for existing in children(style, tag):
                 style.remove(existing)
-        style.extend(parse_fragment(patch))
+        style.extend(patch.elements())
     return serialize_ooxml(root)
 
 
@@ -878,8 +986,9 @@ def build_reference_doc(workdir: Path) -> Path | None:
     Derived from pandoc's own default rather than kept as a stored file, so it
     always matches the installed pandoc instead of drifting from it.
     """
-    default = subprocess.run(
-        ["pandoc", "--print-default-data-file", "reference.docx"], capture_output=True
+    default = subprocess.run(  # noqa: S603 - fixed argv, shell=False
+        [resolve_tool("pandoc"), "--print-default-data-file", "reference.docx"],
+        capture_output=True,
     )
     if default.returncode != 0 or not default.stdout:
         return None
@@ -894,11 +1003,11 @@ def build_reference_doc(workdir: Path) -> Path | None:
                 data = patch_styles(data.decode("utf-8")).encode("utf-8")
             elif item.filename == "word/document.xml":
                 root = parse_ooxml(data.decode("utf-8"), item.filename)
-                body = root.find(qn("w:body"))
+                body = child(root, Tag.BODY)
                 if body is not None:
-                    for existing in body.findall(qn("w:sectPr")):
+                    for existing in children(body, Tag.SECTION_PROPERTIES):
                         body.remove(existing)
-                    body.extend(parse_fragment(SECT_PR))
+                    body.append(section_properties())
                 data = serialize_ooxml(root).encode("utf-8")
             zout.writestr(item, data)
     return out
@@ -958,50 +1067,80 @@ LEAN_TYPES = {
     "Finset",
     "PMF",
 }
-CODE_COLORS = {
-    "keyword": "0033B3",
-    "type": "0F7B6C",
-    "number": "B26B00",
-    "symbol": "7A3E9D",
-    "comment": "6A737D",
-    "plain": "1A1A1A",
-}
+
+
+class TokenKind(StrEnum):
+    """What a token in a code listing is, and the colour that says so.
+
+    The colour travels with the kind rather than sitting in a parallel dict:
+    adding a kind and forgetting its colour used to be a `KeyError` at render
+    time, and is now impossible to write.
+    """
+
+    KEYWORD = "keyword"
+    TYPE = "type"
+    NUMBER = "number"
+    SYMBOL = "symbol"
+    COMMENT = "comment"
+    PLAIN = "plain"
+
+    @property
+    def color(self) -> str:
+        match self:
+            case TokenKind.KEYWORD:
+                return "0033B3"
+            case TokenKind.TYPE:
+                return "0F7B6C"
+            case TokenKind.NUMBER:
+                return "B26B00"
+            case TokenKind.SYMBOL:
+                return "7A3E9D"
+            case TokenKind.COMMENT:
+                return "6A737D"
+            case TokenKind.PLAIN:
+                return "1A1A1A"
+
+
 TOKEN_RE = re.compile(r"--[^\n]*|[A-Za-zℝℕℤℚ_][A-Za-z0-9ℝℕℤℚ_.']*|\d+|\s+|.")
 
 
-def classify_token(tok: str) -> str:
+def classify_token(tok: str) -> TokenKind:
     if tok.startswith("--"):
-        return "comment"
+        return TokenKind.COMMENT
     if tok in LEAN_KEYWORDS:
-        return "keyword"
+        return TokenKind.KEYWORD
     if tok in LEAN_TYPES or (tok[:1].isupper() and tok[:1].isalpha()):
-        return "type"
+        return TokenKind.TYPE
     if tok.isdigit():
-        return "number"
+        return TokenKind.NUMBER
     if not tok.strip():
-        return "plain"
+        return TokenKind.PLAIN
     if not (tok[0].isalnum() or tok[0] == "_"):
-        return "symbol"
-    return "plain"
+        return TokenKind.SYMBOL
+    return TokenKind.PLAIN
 
 
-def make_code_run(token: str) -> ET.Element:
+def make_code_run(token: str) -> SafeElement:
     """One coloured run for one token."""
     kind = classify_token(token)
-    run = ET.Element(qn("w:r"))
-    rpr = ET.SubElement(run, qn("w:rPr"))
-    ET.SubElement(rpr, qn("w:rStyle"), {qn("w:val"): "VerbatimChar"})
-    ET.SubElement(rpr, qn("w:color"), {qn("w:val"): CODE_COLORS[kind]})
-    if kind == "keyword":
-        ET.SubElement(rpr, qn("w:b"))
-    elif kind == "comment":
-        ET.SubElement(rpr, qn("w:i"))
-    text = ET.SubElement(run, qn("w:t"), {XML_SPACE: "preserve"})
-    text.text = token
-    return run
+    properties = [
+        make(Tag.RUN_STYLE, Attr.VAL.of(StyleId.VERBATIM_CHAR)),
+        make(Tag.COLOR, Attr.VAL.of(kind.color)),
+    ]
+    if kind is TokenKind.KEYWORD:
+        properties.append(make(Tag.BOLD))
+    elif kind is TokenKind.COMMENT:
+        properties.append(make(Tag.ITALIC))
+    return make(
+        Tag.RUN,
+        children=[
+            make(Tag.RUN_PROPERTIES, children=properties),
+            make(Tag.TEXT, XML_SPACE_PRESERVE, text=token),
+        ],
+    )
 
 
-def highlight_code_paragraphs(root: ET.Element) -> int:
+def highlight_code_paragraphs(root: SafeElement) -> int:
     """Recolour the runs of every `SourceCode` paragraph, token by token.
 
     A run carrying no `w:t` is passed through untouched. Pandoc puts the line
@@ -1009,31 +1148,31 @@ def highlight_code_paragraphs(root: ET.Element) -> int:
     the whole listing onto one line.
     """
     count = 0
-    for para in root.iter(qn("w:p")):
-        ppr = para.find(qn("w:pPr"))
-        if ppr is None or wval(ppr.find(qn("w:pStyle"))) != "SourceCode":
+    for para in descendants(root, Tag.PARAGRAPH):
+        ppr = child(para, Tag.PARAGRAPH_PROPERTIES)
+        if ppr is None or value_of(child(ppr, Tag.PARAGRAPH_STYLE)) != StyleId.SOURCE_CODE:
             continue
         count += 1
-        rebuilt: list[ET.Element] = []
-        for child in list(para):
-            node = child.find(qn("w:t")) if child.tag == qn("w:r") else None
-            if node is None:
-                rebuilt.append(child)
+        rebuilt: list[SafeElement] = []
+        for node in (SafeElement(e) for e in para):
+            text = child(node, Tag.TEXT) if node.tag == qn(Tag.RUN) else None
+            if text is None:
+                rebuilt.append(node)
                 continue
-            rebuilt.extend(make_code_run(tok) for tok in TOKEN_RE.findall(node.text or ""))
+            rebuilt.extend(make_code_run(tok) for tok in TOKEN_RE.findall(text.text or ""))
         para[:] = rebuilt
     return count
 
 
-def cell_text(cell: ET.Element) -> str:
-    return re.sub(r"\s+", " ", "".join(cell.itertext())).strip()
+def cell_text(cell: SafeElement) -> str:
+    return " ".join("".join(t for t in cell.itertext() if isinstance(t, str)).split())
 
 
-def cell_is_monospace(cell: ET.Element) -> bool:
-    return any(wval(s) == "VerbatimChar" for s in cell.iter(qn("w:rStyle")))
+def cell_is_monospace(cell: SafeElement) -> bool:
+    return any(value_of(s) == "VerbatimChar" for s in descendants(cell, Tag.RUN_STYLE))
 
 
-def column_widths(rows: list[list[ET.Element]], columns: int) -> list[int]:
+def column_widths(rows: list[list[SafeElement]], columns: int) -> list[int]:
     """Size columns by what they hold, then scale the row to the full text width.
 
     A column's floor is set by its longest unbreakable word, not by a flat
@@ -1088,62 +1227,351 @@ def column_widths(rows: list[list[ET.Element]], columns: int) -> list[int]:
 
 
 def _replace_child(
-    parent: ET.Element, tag: str, attrib: dict[str, str], first: bool = False
+    parent: SafeElement, tag: Tag, *attributes: Attribute, first: bool = False
 ) -> None:
-    """Drop every existing `tag` child of parent and add one with these attributes."""
-    for existing in parent.findall(tag):
+    """Drop every existing child with this tag and add one with these attributes."""
+    for existing in children(parent, tag):
         parent.remove(existing)
-    element = ET.Element(tag, attrib)
+    element = make(tag, *attributes)
     if first:
         parent.insert(0, element)
     else:
         parent.append(element)
 
 
-def resize_tables(root: ET.Element) -> int:
+def resize_tables(root: SafeElement) -> int:
     """Make every table span the text width, with columns sized to their content."""
     count = 0
-    for tbl in root.iter(qn("w:tbl")):
-        rows = [tr.findall(qn("w:tc")) for tr in tbl.findall(qn("w:tr"))]
+    for tbl in descendants(root, Tag.TABLE):
+        rows = [children(tr, Tag.TABLE_CELL) for tr in children(tbl, Tag.TABLE_ROW)]
         if not rows:
             continue
         widths = column_widths(rows, max(len(r) for r in rows))
         count += 1
 
-        grid = tbl.find(qn("w:tblGrid"))
+        grid = child(tbl, Tag.TABLE_GRID)
         if grid is not None:
             tail = grid.tail
             grid.clear()
             grid.tail = tail
             for width in widths:
-                ET.SubElement(grid, qn("w:gridCol"), {qn("w:w"): str(width)})
+                grid.append(make(Tag.GRID_COLUMN, Attr.WIDTH.of(width)))
 
-        tblpr = tbl.find(qn("w:tblPr"))
+        tblpr = child(tbl, Tag.TABLE_PROPERTIES)
         if tblpr is None:
-            tblpr = ET.Element(qn("w:tblPr"))
+            tblpr = make(Tag.TABLE_PROPERTIES)
             tbl.insert(0, tblpr)
-        _replace_child(tblpr, qn("w:tblW"), {qn("w:type"): "dxa", qn("w:w"): str(TEXT_WIDTH)})
-        _replace_child(tblpr, qn("w:tblLayout"), {qn("w:type"): "fixed"})
+        _replace_child(tblpr, Tag.TABLE_WIDTH, Attr.TYPE.of(Value.DXA), Attr.WIDTH.of(TEXT_WIDTH))
+        _replace_child(tblpr, Tag.TABLE_LAYOUT, Attr.TYPE.of(Value.FIXED))
 
         # Every cell carries its own width as well as the grid: Google Docs
         # honours the cell width, and a table with only a grid comes in squeezed.
-        for tr in tbl.findall(qn("w:tr")):
+        for tr in children(tbl, Tag.TABLE_ROW):
             index = 0
-            for tc in tr.findall(qn("w:tc")):
-                tcpr = tc.find(qn("w:tcPr"))
+            for tc in children(tr, Tag.TABLE_CELL):
+                tcpr = child(tc, Tag.CELL_PROPERTIES)
                 if tcpr is None:
-                    tcpr = ET.Element(qn("w:tcPr"))
+                    tcpr = make(Tag.CELL_PROPERTIES)
                     tc.insert(0, tcpr)
-                span = int(wval(tcpr.find(qn("w:gridSpan"))) or 1)
+                span = int(value_of(child(tcpr, Tag.GRID_SPAN)) or 1)
                 width = sum(widths[index : index + span]) or widths[-1]
                 index += span
                 _replace_child(
-                    tcpr, qn("w:tcW"), {qn("w:type"): "dxa", qn("w:w"): str(width)}, first=True
+                    tcpr, Tag.CELL_WIDTH, Attr.TYPE.of(Value.DXA), Attr.WIDTH.of(width), first=True
                 )
     return count
 
 
-def restyle_docx(path: Path) -> dict[str, int]:
+# Style ids Google Docs has no native equivalent for, but which this document
+# uses for ordinary running prose. Docs flattens an unmapped style into direct
+# formatting on every paragraph that used it, and direct formatting is
+# unreachable from its style menu, so the body of an imported paper cannot be
+# restyled at all. Both resolve to exactly what `Normal` resolves to here
+# (`BodyText` carries the same spacing, `FirstParagraph` carries none and
+# inherits), so the remap is invisible on the page and total in the menu.
+# Where each of pandoc's paragraph styles has to land for Google Docs to map it
+# onto something in its own style menu. Docs offers Normal text, Title, Subtitle
+# and Heading 1-6 and nothing else; every other style it meets becomes direct
+# formatting on the paragraph, which the menu cannot reach. A paper imported
+# without this can have its headings restyled and nothing else.
+#
+# Compact is table-cell text and differs from Normal only by carrying no space
+# after, so the remap pins that one property back on the paragraph and lets
+# everything else follow the style. Captions and SourceCode keep their own
+# styles: centring and the monospace block are layout this document has to
+# state, and there is no native style that carries either.
+STYLE_REMAP: dict[StyleId, StyleId] = {
+    StyleId.BODY_TEXT: StyleId.NORMAL,
+    StyleId.FIRST_PARAGRAPH: StyleId.NORMAL,
+    StyleId.COMPACT: StyleId.NORMAL,
+    StyleId.BIBLIOGRAPHY: StyleId.NORMAL,
+}
+# Abstract, BlockText and Author are deliberately absent. Abstract carries
+# keepNext, keepLines and its own spacing; BlockText carries the left and right
+# indents that make a block quote a block quote; and Author would have to go to
+# Subtitle, which in pandoc's styles carries a numPr. Remapping any of them
+# would move something on the page, which is the one thing this pass promises
+# not to do. Together they are three paragraphs in a 667-paragraph paper.
+
+# OMML constructs taller than a line of text. A paragraph holding one of these
+# keeps "auto" leading, because a fixed line height crops what overflows it and
+# a clipped integral sign is worse than an uneven page.
+TALL_MATH = (
+    Tag.NARY,
+    Tag.FRACTION,
+    Tag.RADICAL,
+    Tag.MATRIX,
+    Tag.SUB_SUPERSCRIPT,
+    Tag.LIMIT_LOWER,
+    Tag.LIMIT_UPPER,
+    Tag.BOX,
+)
+
+
+# The CT_PPr members that come before w:spacing in the schema sequence. Only
+# the ones pandoc or this converter can emit are listed; anything unlisted
+# sorts after spacing, which is the safe direction to guess in.
+PRECEDE_SPACING = frozenset(
+    qn(tag)
+    for tag in (
+        Tag.PARAGRAPH_STYLE,
+        Tag.KEEP_NEXT,
+        Tag.KEEP_LINES,
+        Tag.NUMBERING_PROPERTIES,
+        Tag.SHADING,
+    )
+)
+
+REMAP_BY_STYLE_ID: Final[dict[str, StyleId]] = {
+    style.value: target for style, target in STYLE_REMAP.items()
+}
+
+
+def paragraph_properties(paragraph: SafeElement) -> SafeElement:
+    """The paragraph's `w:pPr`, created at the front if it has none."""
+    existing = child(paragraph, Tag.PARAGRAPH_PROPERTIES)
+    if existing is not None:
+        return existing
+    created = make(Tag.PARAGRAPH_PROPERTIES)
+    paragraph.insert(0, created)
+    return created
+
+
+def set_spacing(paragraph: SafeElement, *attributes: Attribute) -> None:
+    """Set attributes on the paragraph's own `w:spacing`, creating it if needed.
+
+    Placed before `w:ind`, `w:jc`, `w:rPr` and `w:sectPr` when any of them are
+    present, because CT_PPr is a sequence and those four follow spacing in it.
+    """
+    ppr = paragraph_properties(paragraph)
+    spacing = child(ppr, Tag.SPACING)
+    if spacing is None:
+        spacing = make(Tag.SPACING)
+        # Positioned from what precedes spacing rather than from what follows
+        # it: the preceding set is short and closed, while a dozen elements may
+        # follow, and naming only some of those put spacing out of order
+        # whenever a paragraph carried one of the rest.
+        last = -1
+        for index, element in enumerate(ppr):
+            if element.tag in PRECEDE_SPACING:
+                last = index
+        ppr.insert(last + 1, spacing)
+    for attribute_ in attributes:
+        spacing.set(qn(attribute_.name), attribute_.value)
+
+
+def map_styles_for_docs(document: SafeElement) -> int:
+    """Point every paragraph at a style Google Docs knows, where one exists."""
+    remapped = 0
+    for pstyle in descendants(document, Tag.PARAGRAPH_STYLE):
+        current = value_of(pstyle)
+        # A StrEnum member hashes as its value, so the plain string keys the
+        # dict directly: no membership test and no StyleId() construction.
+        target = REMAP_BY_STYLE_ID.get(current) if current else None
+        if target is None:
+            continue
+        pstyle.set(qn(Attr.VAL), target)
+        remapped += 1
+        if current == StyleId.COMPACT:
+            # pStyle sits inside pPr, which sits inside the paragraph.
+            ppr = pstyle.getparent()
+            paragraph = None if ppr is None else ppr.getparent()
+            if paragraph is not None:
+                set_spacing(SafeElement(paragraph), Attr.AFTER.of(0))
+    return remapped
+
+
+def exempt_tall_math_from_fixed_leading(document: SafeElement) -> int:
+    """Give paragraphs holding a tall equation their leading back.
+
+    Everything else runs on the fixed line height that makes the page match
+    LaTeX. These are the paragraphs where that would crop the maths instead.
+    """
+    exempted = 0
+    for paragraph in descendants(document, Tag.PARAGRAPH):
+        tags = {e.tag for e in paragraph.iter()}
+        if any(qn(tall) in tags for tall in TALL_MATH):
+            set_spacing(SafeElement(paragraph), Attr.LINE_RULE.of(Value.AUTO))
+            exempted += 1
+    return exempted
+
+
+def drop_empty_comments_part(parts: dict[str, bytes]) -> bool:
+    """Remove word/comments.xml when it holds no comments.
+
+    pandoc's reference document ships the part whether or not anything uses it,
+    and this converter never produces a comment. An empty part is inert, but it
+    is also a part every consumer has to open and a relationship every consumer
+    has to resolve, for nothing.
+    """
+    part = "word/comments.xml"
+    if part not in parts:
+        return False
+    if descendants(parse_ooxml(parts[part].decode("utf-8"), part), Tag.COMMENT):
+        return False
+    del parts[part]
+
+    types = "[Content_Types].xml"
+    if types in parts:
+        root = parse_ooxml(parts[types].decode("utf-8"), types)
+        for override in list(root):
+            if attribute(SafeElement(override), Attr.PART_NAME) == f"/{part}":
+                root.remove(override)
+        parts[types] = serialize_ooxml(root).encode("utf-8")
+
+    rels = "word/_rels/document.xml.rels"
+    if rels in parts:
+        root = parse_ooxml(parts[rels].decode("utf-8"), rels)
+        for rel in descendants(root, Tag.RELATIONSHIP):
+            if (attribute(rel, Attr.TARGET) or "").endswith("comments.xml"):
+                root.remove(rel)
+        parts[rels] = serialize_ooxml(root).encode("utf-8")
+    return True
+
+
+def clear_theme_fonts(parts: dict[str, bytes]) -> list[str]:
+    """Leave the theme naming no typeface at all, for any script.
+
+    pandoc's reference doc ships the Microsoft 365 theme, whose faces are Aptos
+    and Aptos Display. Nothing outside a current Office install has them, so
+    every other reader gets a substitution nobody chose.
+
+    Naming a safer font would only move the problem: any name is still this
+    document overriding the template it was imported into. An empty `typeface`
+    is the OOXML way to say nothing, and it leaves headings and body text
+    resolving to whatever Word, Docs or LibreOffice calls normal text.
+
+    The whole font scheme is swept, not just the latin slot. A theme carries a
+    latin, an east-Asian and a complex-script face per slot, and then a
+    per-script table: 94 more names in this one, for Japanese, Korean, Chinese,
+    Arabic, Hebrew and the rest. Clearing two of them and calling the file
+    font-free is the kind of claim that survives only because nobody looked at
+    the other 94. PANOSE goes too: it is a ten-byte description of the face's
+    own metrics, and a renderer that cannot match a name falls back to matching
+    those, which lands on something Aptos-shaped again.
+
+    The styles need no edit. They already point at the theme
+    (`w:asciiTheme="minorHAnsi"`) rather than at a literal name, and the body
+    pins no font at all, so clearing the scheme re-points the whole document.
+    """
+    theme = "word/theme/theme1.xml"
+    if theme not in parts:
+        return []
+    root = parse_ooxml(parts[theme].decode("utf-8"), theme)
+    cleared: list[str] = []
+    for slot in (Tag.MAJOR_FONT, Tag.MINOR_FONT):
+        for scheme in descendants(root, slot):
+            # Every descendant, so the per-script table is covered along with
+            # the three named slots.
+            for element in (SafeElement(e) for e in scheme.iter()):
+                named = attribute(element, Attr.TYPEFACE)
+                if named:
+                    cleared.append(named)
+                if named is not None:
+                    element.set(qn(Attr.TYPEFACE), "")
+                if attribute(element, Attr.PANOSE) is not None:
+                    element.set(qn(Attr.PANOSE), "")
+    parts[theme] = serialize_ooxml(root).encode("utf-8")
+    return cleared
+
+
+def strip_unused_font_table(parts: dict[str, bytes]) -> list[str]:
+    """Drop fontTable entries for faces the document no longer mentions.
+
+    The table is advisory: it carries metrics and embedding hints for fonts the
+    document uses, and Word rebuilds it on save. After the theme is cleared,
+    every entry pandoc inherited from its reference doc describes a face
+    nothing asks for, and Aptos sitting in the table is still this file naming
+    Aptos to whoever opens it.
+
+    Two survive on purpose. Whatever the document pins literally, which is the
+    monospace face for code listings, and Cambria Math, which is the face a
+    renderer reaches for when it lays out the equations: the document names no
+    maths font itself, so removing its table entry would be removing the one
+    hint about what the maths is meant to look like.
+    """
+    table = "word/fontTable.xml"
+    if table not in parts:
+        return []
+    referenced = {MATH_FONT}
+    for part in ("word/document.xml", "word/styles.xml"):
+        if part not in parts:
+            continue
+        tree = parse_ooxml(parts[part].decode("utf-8"), part)
+        for fonts in descendants(tree, Tag.FONTS):
+            referenced |= {name for slot in FONT_NAME_SLOTS if (name := attribute(fonts, slot))}
+
+    root = parse_ooxml(parts[table].decode("utf-8"), table)
+    dropped: list[str] = []
+    for font in children(root, Tag.FONT):
+        name = attribute(font, Attr.NAME)
+        if name is not None and name not in referenced:
+            dropped.append(name)
+            root.remove(font)
+    parts[table] = serialize_ooxml(root).encode("utf-8")
+    return dropped
+
+
+def strip_font_embedding(parts: dict[str, bytes]) -> int:
+    """Remove font-embedding directives inherited from pandoc's reference doc.
+
+    `<w:embedSystemFonts/>` tells Word to bundle the machine's fonts into the
+    file on save. Nothing embeds fonts here, so today it is only a latent
+    instruction, and the day something acts on it the review copy starts
+    shipping a third party's font binary to everyone it is sent to.
+    """
+    settings = "word/settings.xml"
+    if settings not in parts:
+        return 0
+    root = parse_ooxml(parts[settings].decode("utf-8"), settings)
+    removed = 0
+    for tag in (Tag.EMBED_SYSTEM_FONTS, Tag.EMBED_TRUETYPE_FONTS):
+        for element in children(root, tag):
+            root.remove(element)
+            removed += 1
+    parts[settings] = serialize_ooxml(root).encode("utf-8")
+    return removed
+
+
+@dataclass(frozen=True)
+class Restyling:
+    """What the presentation pass changed, for the run to report.
+
+    A dataclass rather than a dict because the fields are not one type: three
+    counts and a list of the typefaces cleared. As a dict[str, int] the list
+    field was a type error nobody could see.
+    """
+
+    tables_resized: int
+    listings_highlighted: int
+    font_directives_stripped: int
+    theme_fonts_cleared: list[str]
+    body_styles_remapped: int
+    tall_math_exempted: int
+    empty_comments_dropped: bool
+
+
+def restyle_docx(path: Path) -> Restyling:
     """Apply the presentation pass to a finished .docx, in place."""
     with zipfile.ZipFile(path) as z:
         parts = {name: z.read(name) for name in z.namelist()}
@@ -1152,17 +1580,49 @@ def restyle_docx(path: Path) -> dict[str, int]:
     document = parse_ooxml(parts["word/document.xml"].decode("utf-8"), "word/document.xml")
     tables = resize_tables(document)
     listings = highlight_code_paragraphs(document)
+    body_styles = map_styles_for_docs(document)
+    exempted = exempt_tall_math_from_fixed_leading(document)
     parts["word/document.xml"] = serialize_ooxml(document).encode("utf-8")
+    directives = strip_font_embedding(parts)
+    # Two independent jobs: a document with no theme still has a font table.
+    cleared = clear_theme_fonts(parts) + strip_unused_font_table(parts)
+    dropped_comments = drop_empty_comments_part(parts)
 
+    # `infos` is the zip listing as it was read, so it still names any part a
+    # pass above deleted. Writing from `parts` and skipping what is gone keeps
+    # the original entry order for everything that survives.
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         for info in infos:
-            z.writestr(info, parts[info.filename])
-    return {"tables_resized": tables, "listings_highlighted": listings}
+            if info.filename in parts:
+                z.writestr(info, parts[info.filename])
+    return Restyling(
+        tables_resized=tables,
+        listings_highlighted=listings,
+        font_directives_stripped=directives,
+        theme_fonts_cleared=cleared,
+        body_styles_remapped=body_styles,
+        tall_math_exempted=exempted,
+        empty_comments_dropped=dropped_comments,
+    )
 
 
 # --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
+
+
+def resolve_tool(name: str) -> str:
+    """The absolute path to an external tool, or exit saying which is missing.
+
+    Running by absolute path rather than by bare name means the binary cannot
+    change under this process because of PATH ordering, which on a machine
+    where the interactive and unattended PATHs disagree is a real difference
+    rather than a theoretical one.
+    """
+    found = shutil.which(name)
+    if found is None:
+        sys.exit(f"Missing required tool: {name}")
+    return found
 
 
 def require_tools(engine: str) -> None:
@@ -1256,36 +1716,34 @@ def convert(
         notes.extend(failures)
 
     rewritten, stats = rewrite_source(src, figures, figdir)
-    if stats["flattened"]:
+    if stats.flattened:
         notes.append(
-            f"Flattened {stats['flattened']} nested tabular cell(s); "
+            f"Flattened {stats.flattened} nested tabular cell(s); "
             "pandoc drops those tables otherwise."
         )
-    if stats["unstarred"]:
+    if stats.unstarred:
         notes.append(
-            f"Unstarred {stats['unstarred']} table*/figure* environment(s); "
+            f"Unstarred {stats.unstarred} table*/figure* environment(s); "
             "pandoc drops the caption of a starred float."
         )
-    if stats["refs"]:
+    if stats.refs:
+        notes.append(f"Resolved {stats.refs} table/figure/theorem cross-reference(s) to numbers.")
+    if stats.listings:
         notes.append(
-            f"Resolved {stats['refs']} table/figure/theorem cross-reference(s) to numbers."
-        )
-    if stats["listings"]:
-        notes.append(
-            f"Converted {stats['listings']} alltt listing(s) to verbatim to keep "
+            f"Converted {stats.listings} alltt listing(s) to verbatim to keep "
             "their spacing; math escapes became literal characters."
         )
-    if stats["unmapped"]:
+    if stats.unmapped:
         notes.append(
             "No character mapping for these macros in a listing, so they were dropped: "
-            + ", ".join(sorted(stats["unmapped"]))
+            + ", ".join(sorted(stats.unmapped))
             + ". Add them to MATH_TO_UNICODE."
         )
     work_tex = workdir / "converted.tex"
     work_tex.write_text(rewritten, encoding="utf-8")
 
     cmd = [
-        "pandoc",
+        resolve_tool("pandoc"),
         str(work_tex),
         "-o",
         str(out_path),
@@ -1303,16 +1761,35 @@ def convert(
             "--metadata",
             "reference-section-title=References",
         ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
     if proc.returncode != 0:
         notes.append(f"pandoc exited {proc.returncode}: {proc.stderr.strip()[:800]}")
 
     if out_path.exists():
         styling = restyle_docx(out_path)
         say(
-            f"Styled: {styling['tables_resized']} table(s) set to the full text width, "
-            f"{styling['listings_highlighted']} listing(s) highlighted"
+            f"Styled: {styling.tables_resized} table(s) set to the full text width, "
+            f"{styling.listings_highlighted} listing(s) highlighted"
         )
+        if styling.body_styles_remapped:
+            say(
+                f"Styles: {styling.body_styles_remapped} paragraph(s) moved onto a style Google "
+                f"Docs knows; {styling.tall_math_exempted} kept auto leading for tall maths"
+            )
+        if styling.font_directives_stripped or styling.theme_fonts_cleared:
+            # A theme names a face per script, so spelling them all out buries
+            # the rest of the report under ninety-odd names. The count is what
+            # says the sweep was total; the first two are what a reader
+            # recognises as the ones that were causing trouble.
+            cleared = styling.theme_fonts_cleared
+            distinct = list(dict.fromkeys(cleared))
+            shown = ", ".join(distinct[:2])
+            rest = f", and {len(distinct) - 2} more" if len(distinct) > 2 else ""
+            say(
+                f"Fonts: {styling.font_directives_stripped} embedding directive(s) removed, "
+                f"{len(cleared)} typeface name(s) dropped from the theme and font table "
+                f"({shown}{rest}) so the reader's template supplies them"
+            )
 
     from .verification import verify
 

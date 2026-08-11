@@ -8,6 +8,7 @@ private repo and must not be copied here.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,7 +20,7 @@ pytestmark = pytest.mark.regression
 
 def test_paper_still_converts_to_the_recorded_shape(
     regression_tex: Path,
-    regression_baseline: dict,
+    regression_baseline: dict[str, Any],
     tools_available: None,
     tmp_path: Path,
 ) -> None:

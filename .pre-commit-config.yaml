@@ -1,13 +1,47 @@
-# Optional local guard — catches secrets before they're committed (the cheapest
-# place to stop a leak). `pre-commit install` refuses under this machine's
-# global core.hooksPath, so write the shim directly instead:
+# Local guard: catch secrets, and autoformat and lint on the way into a commit,
+# so review never spends a round on whitespace and the banned-api rules cannot
+# be walked past by accident.
+#
+# `pre-commit install` refuses under this machine's global core.hooksPath (the
+# gitleaks guard), and its error suggests unsetting that path, which would drop
+# the secrets guard machine-wide. The global hook already chains to the repo's
+# own, so write the shim directly instead:
 #
 #     printf '#!/bin/sh\nexec pre-commit run\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
 #
-# After that, gitleaks runs automatically on staged changes at every commit,
-# using the rules in .gitleaks.toml. Run on demand with: pre-commit run --all-files
+# `make check` runs the same lint, type and test gates, and CI runs them too.
+# This file is the local half; neither is authority over the other.
+#
+# Keep `rev` level with the ruff that `pip install -e '.[dev]'` resolves, for
+# the reason the CI workflow pins Python: a version skew between here and there
+# is what turns a green local run into a red CI run. Dependabot has no
+# pre-commit ecosystem, so that one is `pre-commit autoupdate` by hand.
 repos:
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.1
     hooks:
+      # Runs on staged changes using the rules in .gitleaks.toml, which nothing
+      # else local reads. Also runs in CI on every push.
       - id: gitleaks
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      # Order matters: fix and format first, then re-check, so a fixable
+      # finding is repaired rather than reported.
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (strict)
+        entry: .venv/bin/mypy
+        language: system
+        pass_filenames: false
+        types: [python]
+      - id: selftest
+        name: self-test (every check fails on input built to break it)
+        entry: .venv/bin/tex2gdoc --self-test
+        language: system
+        pass_filenames: false
+        always_run: true

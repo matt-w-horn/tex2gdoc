@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -28,12 +29,13 @@ def regression_tex() -> Path:
 
 
 @pytest.fixture(scope="session")
-def regression_baseline(regression_tex: Path) -> dict:
+def regression_baseline(regression_tex: Path) -> dict[str, Any]:
     """The recorded fingerprint, which lives beside the paper, not in this repo."""
     path = regression_tex.parent / ".verify" / "tex2gdoc-baseline.json"
     if not path.exists():
         pytest.skip(f"no baseline at {path}; run scripts/record_baseline.py once")
-    return json.loads(path.read_text(encoding="utf-8"))
+    baseline: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    return baseline
 
 
 @pytest.fixture(scope="session")
