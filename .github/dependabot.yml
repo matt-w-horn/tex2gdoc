@@ -1,5 +1,9 @@
-# Dependabot version updates — keep the dev toolchain (pytest, ruff) and the CI
-# actions patched. There are no runtime dependencies yet.
+# Dependabot version updates — keep the dev toolchain (pytest, ruff, mypy), the
+# one runtime dependency (lxml), and the CI actions patched.
+#
+# It does not cover .pre-commit-config.yaml: there is no pre-commit ecosystem,
+# so a ruff bump here leaves that file's `rev` behind. `pre-commit autoupdate`
+# is the other half, and the two have to stay level or local and CI disagree.
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
 version: 2
 updates:

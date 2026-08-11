@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import sys
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -42,8 +43,13 @@ def declared_check_names() -> set[str]:
 
     Relies on one convention, worth keeping: a check name is a literal string,
     never an f-string.
+
+    The whole module is parsed, not just `verify`. A check built in a helper
+    that `verify` calls is still a check, and reading only `verify` would let
+    one skip the coverage gate entirely: the exact condition this file exists
+    to prevent, reintroduced by where someone chose to put a function.
     """
-    tree = ast.parse(inspect.getsource(verify))
+    tree = ast.parse(inspect.getsource(sys.modules[verify.__module__]))
     return {
         node.args[0].value
         for node in ast.walk(tree)
@@ -65,6 +71,8 @@ CAPTION_PROBE = "a distinctive caption phrase"
 TABLE_PROBE = "Provenance"
 LISTING_PROBE = "structure Loop where"
 CITATION_KEY = "present2020"
+
+_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 _COL = TEXT_WIDTH // 2
 _COLS = [_COL, TEXT_WIDTH - _COL]
@@ -120,6 +128,7 @@ _BIB_ENTRY = (
 def good_document_xml(
     *,
     body: str | None = None,
+    body_style: str | None = None,
     omath: int = 2,
     heading_style: str = "Heading1",
     code_coloured: bool = True,
@@ -146,12 +155,17 @@ def good_document_xml(
         ' xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">'
         "<w:body>"
         + _para("Section One", heading_style)
-        + f'<w:p><w:pPr></w:pPr><w:r><w:t xml:space="preserve">{prose}</w:t></w:r>{math}</w:p>'
+        + (
+            f"<w:p><w:pPr>{f"<w:pStyle w:val='{body_style}' />" if body_style else ''}</w:pPr>"
+            f'<w:r><w:t xml:space="preserve">{prose}</w:t></w:r>{math}</w:p>'
+        )
         + _para(caption, "ImageCaption")
         + (table if table is not None else _table())
         + _code_paragraph(code_text, coloured=code_coloured)
         + _para(references, references_style)
-        + _para(bib_entry, "Bibliography")
+        # Normal, not pandoc Bibliography: the converter remaps that one, so a
+        # fixture using it would no longer describe what ships.
+        + _para(bib_entry)
         + _SECT_PR
         + "</w:body></w:document>"
     )
@@ -216,8 +230,61 @@ def good_facts(document_xml: str) -> SourceFacts:
     )
 
 
+# A complete, clean package for the known-good case. Without these the three
+# package-level checks pass against an absence: no .rels to walk, no settings
+# to find an embed flag in, no theme and no font table. That is the condition
+# this module exists to prevent, reproduced inside the module itself.
+_PKG_RELS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_DRAWINGML = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+GOOD_RELS = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    f'<Relationships xmlns="{_PKG_RELS}">'
+    '<Relationship Id="rId1"'
+    ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"'
+    ' Target="https://example.invalid/paper" TargetMode="External" />'
+    '<Relationship Id="rId2"'
+    ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"'
+    ' Target="media/image0.png" />'
+    "</Relationships>"
+)
+
+GOOD_SETTINGS = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    f'<w:settings xmlns:w="{_W}"><w:zoom w:percent="100" /></w:settings>'
+)
+
+GOOD_THEME = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    f'<a:theme xmlns:a="{_DRAWINGML}"><a:themeElements>'
+    '<a:fontScheme name="Office">'
+    '<a:majorFont><a:latin typeface="" /><a:ea typeface="" /><a:cs typeface="" /></a:majorFont>'
+    '<a:minorFont><a:latin typeface="" /><a:ea typeface="" /><a:cs typeface="" /></a:minorFont>'
+    "</a:fontScheme></a:themeElements></a:theme>"
+)
+
+GOOD_FONT_TABLE = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    f'<w:fonts xmlns:w="{_W}"><w:font w:name="Courier New" />'
+    '<w:font w:name="Cambria Math" /></w:fonts>'
+)
+
+GOOD_PACKAGE = {
+    "word/_rels/document.xml.rels": GOOD_RELS,
+    "word/settings.xml": GOOD_SETTINGS,
+    "word/theme/theme1.xml": GOOD_THEME,
+    "word/fontTable.xml": GOOD_FONT_TABLE,
+}
+
+
 def write_docx(
-    directory: Path, document_xml: str, styles_xml: str, media: int = 1, name: str = "case.docx"
+    directory: Path,
+    document_xml: str,
+    styles_xml: str,
+    media: int = 1,
+    name: str = "case.docx",
+    extra_parts: dict[str, str] | None = None,
+    package: bool = True,
 ) -> Path:
     out = directory / name
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
@@ -225,6 +292,12 @@ def write_docx(
         z.writestr("word/styles.xml", styles_xml)
         for i in range(media):
             z.writestr(f"word/media/image{i}.png", b"\x89PNG\r\n\x1a\n")
+        # A complete clean package by default, so the package-level checks are
+        # exercised against something correct rather than against nothing.
+        # `extra_parts` overrides an entry to make one of them fail.
+        parts = {**(GOOD_PACKAGE if package else {}), **(extra_parts or {})}
+        for part, body in parts.items():
+            z.writestr(part, body)
     return out
 
 
@@ -253,6 +326,8 @@ def _case(
     stderr: str = "",
     facts_from: str | None = None,
     mutate_facts: Callable[[SourceFacts], None] | None = None,
+    extra_parts: dict[str, str] | None = None,
+    package: bool = True,
 ) -> Build:
     """Assemble a build function from the levers above."""
 
@@ -262,9 +337,41 @@ def _case(
         facts = good_facts(facts_from if facts_from is not None else good_document_xml())
         if mutate_facts:
             mutate_facts(facts)
-        return write_docx(tmp, doc, sty, media=media), facts, stderr
+        return (
+            write_docx(tmp, doc, sty, media=media, extra_parts=extra_parts, package=package),
+            facts,
+            stderr,
+        )
 
     return build
+
+
+# A relationship part carrying one image the reader's machine would go and
+# fetch on open. The Target is unreachable on purpose: nothing in the test
+# suite may touch the network, and the check reads the declaration, not the URL.
+LINKED_IMAGE_RELS = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId99"'
+    ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"'
+    ' Target="https://example.invalid/logo.png" TargetMode="External" />'
+    "</Relationships>"
+)
+
+# A theme naming a face in both slots, the state pandoc's reference doc arrives
+# in. The east-Asian and complex-script slots are left empty, which is both what
+# a real theme looks like and a second thing the check must not mistake for a
+# pinned font.
+_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+THEME_NAMING_A_FONT = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    f'<a:theme xmlns:a="{_A}"><a:themeElements><a:fontScheme name="Office">'
+    '<a:majorFont><a:latin typeface="Aptos Display" panose="02110004020202020204" />'
+    '<a:ea typeface="" /><a:cs typeface="" /></a:majorFont>'
+    '<a:minorFont><a:latin typeface="" /><a:font script="Jpan" typeface="游ゴシック" />'
+    '<a:ea typeface="" /><a:cs typeface="" /></a:minorFont>'
+    "</a:fontScheme></a:themeElements></a:theme>"
+)
 
 
 # Checks that return early and therefore never appear beside the others.
@@ -409,6 +516,34 @@ CALIBRATIONS: dict[str, Calibration] = {
         # Stating that the source was far longer is what truncation actually is.
         _case(document=good_document_xml(body="x"), mutate_facts=_source_was_much_longer),
         "most of the prose missing, against a source that had it",
+    ),
+    "no external dependencies": Calibration(
+        "no external dependencies",
+        "FAIL",
+        # An externally linked image, which is the family that matters: opening
+        # the file reaches out to a host the reader never chose. A hyperlink
+        # would not do here, and a case built from one would have calibrated
+        # nothing, since hyperlinks are the allowed kind.
+        _case(extra_parts={"word/_rels/document.xml.rels": LINKED_IMAGE_RELS}),
+        "an image the reader's machine would fetch from the network on open",
+    ),
+    "body styles are native": Calibration(
+        "body styles are native",
+        "FAIL",
+        # A body paragraph left on pandoc's BodyText, which Docs flattens into
+        # direct formatting that its style menu cannot reach.
+        _case(document=good_document_xml(body_style="BodyText")),
+        "running prose on a style Google Docs turns into direct formatting",
+    ),
+    "fonts left to the template": Calibration(
+        "fonts left to the template",
+        "FAIL",
+        # A theme that names a face, which is what pandoc's reference doc ships
+        # and what overrides the template the file is imported into. A monospace
+        # pin would not do: that one is allowed, so a case built from it would
+        # calibrate nothing.
+        _case(extra_parts={"word/theme/theme1.xml": THEME_NAMING_A_FONT}),
+        "the theme names a typeface, overriding whatever template hosts the file",
     ),
 }
 

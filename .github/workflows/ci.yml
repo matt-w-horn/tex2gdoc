@@ -28,6 +28,13 @@ jobs:
           # doesn't have; without this the step errors on "no file matched".
           cache-dependency-path: pyproject.toml
       - run: pip install -e '.[dev]'
+      # The same gates as `make check`, spelled out so a failure names the
+      # step that failed. Keep the two in step: a gate that runs locally and
+      # not here is one that only fails after the push.
       - run: ruff check .
       - run: ruff format --check .
+      - run: mypy
+      # pytest covers the calibration gate (every check must fail on input
+      # built to break it, and every check must have a case), so `--self-test`
+      # is not run separately here.
       - run: pytest

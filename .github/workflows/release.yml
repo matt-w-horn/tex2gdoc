@@ -64,6 +64,7 @@ jobs:
           pip install -e '.[dev]'
           ruff check .
           ruff format --check .
+          mypy
           pytest -q
 
       - name: Build the tarball

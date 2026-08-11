@@ -4,17 +4,21 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tex2gdoc"
-version = "0.1.0"
+version = "0.2.0"
 description = "Convert a LaTeX paper to a .docx for review in Word or Google Docs"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Matt Horn", email = "matt@matthorn.io" }]
 requires-python = ">=3.14"
-dependencies = []
+# lxml only. python-docx was the obvious candidate and does not fit: every
+# part this tool edits (theme1.xml, settings.xml, fontTable.xml, the .rels)
+# is outside its object model, so it would have been a dependency that only
+# ever handed back the lxml element underneath.
+dependencies = ["lxml"]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+dev = ["pytest", "ruff", "mypy", "lxml-stubs", "pre-commit"]
 
 [project.scripts]
 tex2gdoc = "tex2gdoc.tex2gdoc:main"
@@ -25,10 +29,39 @@ line-length = 100
 [tool.ruff.lint]
 # Defaults are E4/E7/E9 + F only. Adding I (import order), UP (pyupgrade) and
 # B (bugbear) costs nothing to run and catches the things review would flag.
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "TID", "S"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
   "regression: converts a real paper and compares it against a recorded fingerprint; needs TEX2GDOC_REGRESSION_TEX plus pandoc and a TeX engine, so it skips in CI",
 ]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# The hardening in `ooxml` is worth nothing if a later edit parses around it.
+# These are errors everywhere; `ooxml.py` is the one exemption, below.
+# Every XML parser in the stdlib and in lxml, not just the two that were
+# reached for first. A ban that lists some of the doors is a ban on the doors
+# it lists, and `xml.dom.minidom` parses a DOCTYPE as happily as ElementTree.
+"xml.etree.ElementTree".msg = "use tex2gdoc.ooxml: stdlib ElementTree has no DTD or entity guard"
+"xml.etree.cElementTree".msg = "use tex2gdoc.ooxml: stdlib ElementTree has no DTD or entity guard"
+"xml.dom".msg = "use tex2gdoc.ooxml.parse_part; minidom and pulldom resolve entities"
+"xml.dom.minidom".msg = "use tex2gdoc.ooxml.parse_part; minidom resolves entities"
+"xml.dom.pulldom".msg = "use tex2gdoc.ooxml.parse_part; pulldom resolves entities"
+"xml.sax".msg = "use tex2gdoc.ooxml.parse_part; sax loads external DTDs by default"
+"xml.parsers.expat".msg = "use tex2gdoc.ooxml.parse_part rather than driving expat directly"
+"lxml.etree".msg = "use tex2gdoc.ooxml.parse_part, which is the package's only hardened parser"
+"lxml.objectify".msg = "use tex2gdoc.ooxml.parse_part; objectify parses with its own settings"
+"lxml.html".msg = "use tex2gdoc.ooxml.parse_part; the HTML parser has different guards"
+"defusedxml".msg = "not needed: ooxml.parse_part disables entities, DTDs and network access"
+
+[tool.ruff.lint.per-file-ignores]
+# The one module allowed to touch lxml directly: it *is* the safe wrapper.
+"src/tex2gdoc/ooxml.py" = ["TID251"]
+# assert is the point of a test, and test fixtures are not attack surface.
+"tests/**" = ["S101"]
+"src/tex2gdoc/_calibration.py" = ["S101"]

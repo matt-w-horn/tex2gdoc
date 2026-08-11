@@ -3,6 +3,9 @@
 The converter lives in `tex2gdoc.tex2gdoc` and the checks in
 `tex2gdoc.verification`. Both are re-exported here so callers can write
 `from tex2gdoc import convert` rather than repeating the name.
+`tex2gdoc.ooxml` sits under both: it owns the only XML parser, the element
+builder, and the tag and attribute names, and it is not re-exported because
+nothing outside the package should be building OOXML by hand.
 
 Importing this package runs no external tool. `require_tools()` is called only
 by `convert`'s CLI entry point and by `self_test`, so `import tex2gdoc` works
@@ -21,7 +24,7 @@ from .tex2gdoc import (
 )
 from .verification import Check, verify
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Check",

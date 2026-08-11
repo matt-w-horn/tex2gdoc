@@ -21,14 +21,11 @@ been removed rather than left as a second way to count the same thing.
 from __future__ import annotations
 
 import re
-import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
-from .tex2gdoc import STYLE_PATCHES, TEXT_WIDTH, parse_ooxml
-
-W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+from .ooxml import Attr, SafeElement, Tag, Value, attribute, child, descendants, value_of
+from .tex2gdoc import STYLE_PATCHES, TEXT_WIDTH, StyleId, parse_ooxml
 
 # How far each metric may move before it counts as a regression. "exact" is for
 # invariants of correctness; a percentage is for numbers that a pandoc or
@@ -67,25 +64,24 @@ TOLERANCES: dict[str, float | str] = {
 DANGLING_LABEL_RE = re.compile(r"\[(?:tab|fig|thm|sec|app|eq):[A-Za-z0-9_\-]+\]")
 
 
-def _pstyle_count(root: ET.Element, style_id: str) -> int:
-    return sum(1 for e in root.iter(f"{{{W}}}pStyle") if e.get(f"{{{W}}}val") == style_id)
+def _pstyle_count(root: SafeElement, style_id: str) -> int:
+    return sum(1 for e in descendants(root, Tag.PARAGRAPH_STYLE) if value_of(e) == style_id)
 
 
-def _colored_code_runs(root: ET.Element) -> int:
+def _colored_code_runs(root: SafeElement) -> int:
     """Runs carrying the VerbatimChar character style AND an explicit colour.
 
     The tree equivalent of the old adjacency regex, and immune to the tag spacing
     that regex depended on.
     """
     total = 0
-    for run in root.iter(f"{{{W}}}r"):
-        rpr = run.find(f"{{{W}}}rPr")
+    for run in descendants(root, Tag.RUN):
+        rpr = child(run, Tag.RUN_PROPERTIES)
         if rpr is None:
             continue
-        style = rpr.find(f"{{{W}}}rStyle")
-        if style is None or style.get(f"{{{W}}}val") != "VerbatimChar":
+        if value_of(child(rpr, Tag.RUN_STYLE)) != StyleId.VERBATIM_CHAR:
             continue
-        if rpr.find(f"{{{W}}}color") is not None:
+        if child(rpr, Tag.COLOR) is not None:
             total += 1
     return total
 
@@ -104,33 +100,41 @@ def measure_docx(path: Path) -> dict[str, int]:
     doc = parse_ooxml(raw_document, "word/document.xml")
     styles = parse_ooxml(raw_styles, "word/styles.xml") if raw_styles else None
 
-    text = re.sub(r"<[^>]+>", "", raw_document)
+    # Tree text, the same extraction verify() uses, so the two stay comparable.
+    # This was a regex tag strip until 2026-08-10; on the real paper the two
+    # differ by 0.18%, well inside this metric's 10% tolerance, so recorded
+    # baselines survived the change.
+    text = "".join(t for t in doc.itertext() if isinstance(t, str))
     ref_pos = max(text.rfind("References"), text.rfind("Bibliography"))
 
     grid_sums = [
-        sum(int(c.get(f"{{{W}}}w", "0")) for c in grid.iter(f"{{{W}}}gridCol"))
-        for grid in doc.iter(f"{{{W}}}tblGrid")
+        sum(int(attribute(c, Attr.WIDTH) or 0) for c in descendants(grid, Tag.GRID_COLUMN))
+        for grid in descendants(doc, Tag.TABLE_GRID)
     ]
 
     return {
         "docx_size_bytes": path.stat().st_size,
         "media_files": sum(1 for n in names if n.startswith("word/media/")),
-        "drawings": sum(1 for _ in doc.iter(f"{{{W}}}drawing")),
-        "omath": sum(1 for _ in doc.iter(f"{{{M}}}oMath")),
-        "tbl": sum(1 for _ in doc.iter(f"{{{W}}}tbl")),
-        "tc": sum(1 for _ in doc.iter(f"{{{W}}}tc")),
+        "drawings": len(descendants(doc, Tag.DRAWING)),
+        "omath": len(descendants(doc, Tag.MATH)),
+        "tbl": len(descendants(doc, Tag.TABLE)),
+        "tc": len(descendants(doc, Tag.TABLE_CELL)),
         "tc_with_tcW_dxa": sum(
-            1 for e in doc.iter(f"{{{W}}}tcW") if e.get(f"{{{W}}}type") == "dxa"
+            1 for e in descendants(doc, Tag.CELL_WIDTH) if attribute(e, Attr.TYPE) == Value.DXA
         ),
         "tblW_at_text_width": sum(
             1
-            for e in doc.iter(f"{{{W}}}tblW")
-            if e.get(f"{{{W}}}type") == "dxa" and e.get(f"{{{W}}}w") == str(TEXT_WIDTH)
+            for e in descendants(doc, Tag.TABLE_WIDTH)
+            if attribute(e, Attr.TYPE) == Value.DXA and attribute(e, Attr.WIDTH) == str(TEXT_WIDTH)
         ),
         "tblgrids": len(grid_sums),
         "tblgrids_summing_to_text_width": sum(1 for s in grid_sums if s == TEXT_WIDTH),
-        "pct_widths": sum(1 for e in doc.iter() if e.get(f"{{{W}}}type") == "pct"),
-        "gridspans": sum(1 for _ in doc.iter(f"{{{W}}}gridSpan")),
+        "pct_widths": sum(
+            1
+            for e in (SafeElement(x) for x in doc.iter())
+            if attribute(e, Attr.TYPE) == Value.PERCENT
+        ),
+        "gridspans": len(descendants(doc, Tag.GRID_SPAN)),
         "heading1": _pstyle_count(doc, "Heading1"),
         "heading2": _pstyle_count(doc, "Heading2"),
         "sourcecode_paragraphs": _pstyle_count(doc, "SourceCode"),
@@ -140,13 +144,15 @@ def measure_docx(path: Path) -> dict[str, int]:
         "dangling_labels": len(set(DANGLING_LABEL_RE.findall(text))),
         "reference_tail_chars": (len(text) - ref_pos) if ref_pos >= 0 else 0,
         "styles_defined": (
-            sum(1 for e in styles.iter(f"{{{W}}}style") if e.get(f"{{{W}}}styleId"))
+            sum(1 for e in descendants(styles, Tag.STYLE) if attribute(e, Attr.STYLE_ID))
             if styles is not None
             else 0
         ),
         "patched_styles_present": (
             sum(
-                1 for e in styles.iter(f"{{{W}}}style") if e.get(f"{{{W}}}styleId") in STYLE_PATCHES
+                1
+                for e in descendants(styles, Tag.STYLE)
+                if attribute(e, Attr.STYLE_ID) in STYLE_PATCHES
             )
             if styles is not None
             else 0

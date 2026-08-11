@@ -10,20 +10,29 @@ VENV := .venv
 PY   := $(VENV)/bin/python
 TEX  ?=
 
-.PHONY: help check lint test selftest docx regression baseline clean
+.PHONY: help check lint format typecheck test selftest docx regression baseline clean
 
 help:
-	@echo "make check                 ruff + pytest; no pandoc or TeX needed"
+	@echo "make check                 ruff + mypy + pytest; no pandoc or TeX needed"
+	@echo "make format                autoformat and autofix in place"
 	@echo "make selftest              prove every check fails on input built to break it"
 	@echo "make docx TEX=paper.tex    regenerate and verify a .docx"
 	@echo "make regression TEX=…      convert and compare against the recorded baseline"
 	@echo "make baseline TEX=…        record a new baseline beside that paper"
 
-check: lint test
+check: lint typecheck test
 
 lint:
 	$(VENV)/bin/ruff check .
 	$(VENV)/bin/ruff format --check .
+
+# Autoformat and autofix in place. `lint` only reports; this one edits.
+format:
+	$(VENV)/bin/ruff check --fix .
+	$(VENV)/bin/ruff format .
+
+typecheck:
+	$(VENV)/bin/mypy
 
 test:
 	$(VENV)/bin/pytest -q
@@ -46,5 +55,5 @@ baseline:
 	$(PY) scripts/record_baseline.py "$(TEX)"
 
 clean:
-	rm -rf .pytest_cache .ruff_cache
+	rm -rf .pytest_cache .ruff_cache .mypy_cache
 	find . -name __pycache__ -type d -prune -exec rm -rf {} +

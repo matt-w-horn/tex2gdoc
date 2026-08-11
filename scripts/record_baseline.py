@@ -33,7 +33,9 @@ from tex2gdoc.tex2gdoc import convert, default_tex_engine  # noqa: E402
 
 def tool_version(name: str, *args: str) -> str:
     try:
-        out = subprocess.run([name, *args], capture_output=True, text=True, timeout=30)
+        out = subprocess.run(  # noqa: S603 - a version probe of a developer tool
+            [name, *args], capture_output=True, text=True, timeout=30
+        )
         return (out.stdout or out.stderr).strip().splitlines()[0]
     except Exception as exc:  # noqa: BLE001 - a missing tool is data, not a crash
         return f"unavailable ({type(exc).__name__})"
